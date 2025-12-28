@@ -152,9 +152,10 @@ namespace AppInstaller::Utility
             }
 
             // Prepare command line: github_fast.exe <url> -o <output_path>
-            // Use proper Windows command line escaping
-            // In Windows, arguments are quoted and internal quotes are escaped
-            // Backslashes only need escaping when they precede a quote
+            // Use proper Windows command line escaping according to MSDN rules:
+            // 1. Backslashes are interpreted literally unless they immediately precede a double quote
+            // 2. When backslashes precede a quote, each pair of backslashes represents one literal backslash
+            // 3. An odd number of backslashes followed by a quote means the quote is escaped
             auto escapeArg = [](const std::wstring& arg) -> std::wstring {
                 std::wstring result = L"\"";
                 size_t backslashCount = 0;
@@ -167,22 +168,23 @@ namespace AppInstaller::Utility
                     }
                     else if (c == L'\"')
                     {
-                        // Escape the backslashes that precede the quote
-                        result.append(backslashCount, L'\\');
+                        // Escape the backslashes (double them) before the quote
+                        result.append(backslashCount * 2, L'\\');
                         // Escape the quote itself
                         result += L"\\\"";
                         backslashCount = 0;
                     }
                     else
                     {
+                        // Regular character - backslashes don't need escaping
                         result.append(backslashCount, L'\\');
                         result += c;
                         backslashCount = 0;
                     }
                 }
                 
-                // Handle trailing backslashes
-                result.append(backslashCount, L'\\');
+                // Escape trailing backslashes (they precede the closing quote)
+                result.append(backslashCount * 2, L'\\');
                 result += L"\"";
                 return result;
             };
