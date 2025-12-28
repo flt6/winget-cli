@@ -111,11 +111,25 @@ namespace AppInstaller::Utility
                 return false;
             }
 
-            // Check for github.com or api.github.com as the domain
-            // Use case-insensitive comparison for the protocol and domain
-            std::string lowerUrl = Utility::FoldCase(url);
-            return (lowerUrl.find("https://github.com/") != std::string::npos ||
-                    lowerUrl.find("https://api.github.com/") != std::string::npos);
+            // Parse the URL to check the actual domain
+            // The URL should start with https://github.com/ or https://api.github.com/
+            if (!CaseInsensitiveStartsWith(url, "https://github.com/") &&
+                !CaseInsensitiveStartsWith(url, "https://api.github.com/"))
+            {
+                return false;
+            }
+
+            // Additional check: ensure the domain ends properly (followed by / or end of string)
+            // This prevents matching domains like github.com.malicious.org
+            size_t domainEndPos = url.find('/', 8); // Skip past "https://"
+            if (domainEndPos != std::string_view::npos)
+            {
+                std::string_view domain = url.substr(8, domainEndPos - 8);
+                return (CaseInsensitiveEquals(domain, "github.com") || 
+                        CaseInsensitiveEquals(domain, "api.github.com"));
+            }
+
+            return false;
         }
 
         // Download using github_fast.exe
@@ -138,33 +152,46 @@ namespace AppInstaller::Utility
             }
 
             // Prepare command line: github_fast.exe <url> -o <output_path>
-            // Use proper escaping for arguments by wrapping in quotes and escaping internal quotes
+            // Use proper Windows command line escaping
+            // In Windows, arguments are quoted and internal quotes are escaped
+            // Backslashes only need escaping when they precede a quote
             auto escapeArg = [](const std::wstring& arg) -> std::wstring {
-                std::wstring escaped = L"\"";
+                std::wstring result = L"\"";
+                size_t backslashCount = 0;
+                
                 for (wchar_t c : arg)
                 {
-                    if (c == L'\"')
+                    if (c == L'\\')
                     {
-                        escaped += L"\\\"";
+                        backslashCount++;
                     }
-                    else if (c == L'\\')
+                    else if (c == L'\"')
                     {
-                        escaped += L"\\\\";
+                        // Escape the backslashes that precede the quote
+                        result.append(backslashCount, L'\\');
+                        // Escape the quote itself
+                        result += L"\\\"";
+                        backslashCount = 0;
                     }
                     else
                     {
-                        escaped += c;
+                        result.append(backslashCount, L'\\');
+                        result += c;
+                        backslashCount = 0;
                     }
                 }
-                escaped += L"\"";
-                return escaped;
+                
+                // Handle trailing backslashes
+                result.append(backslashCount, L'\\');
+                result += L"\"";
+                return result;
             };
 
-            std::wstring commandLine = escapeArg(githubFastPath.wstring()) + L" " + 
-                                       escapeArg(Utility::ConvertToUTF16(url)) + L" -o " + 
-                                       escapeArg(dest.wstring());
+            std::wstring commandLineStr = escapeArg(githubFastPath.wstring()) + L" " + 
+                                          escapeArg(Utility::ConvertToUTF16(url)) + L" -o " + 
+                                          escapeArg(dest.wstring());
 
-            AICLI_LOG(Core, Info, << "Executing: " << Utility::ConvertToUTF8(commandLine));
+            AICLI_LOG(Core, Info, << "Executing: " << Utility::ConvertToUTF8(commandLineStr));
 
             // Create process
             STARTUPINFOW si = { sizeof(si) };
@@ -172,6 +199,10 @@ namespace AppInstaller::Utility
             si.wShowWindow = SW_HIDE;
 
             PROCESS_INFORMATION pi = {};
+
+            // CreateProcessW may modify the command line buffer, so we need a mutable copy
+            std::vector<wchar_t> commandLine(commandLineStr.begin(), commandLineStr.end());
+            commandLine.push_back(L'\0');
 
             if (!CreateProcessW(
                 nullptr,
@@ -211,7 +242,10 @@ namespace AppInstaller::Utility
             if (progress.IsCancelledBy(CancelReason::Any))
             {
                 AICLI_LOG(Core, Info, << "Download cancelled by user");
-                // Note: TerminateProcess is used here as github_fast.exe is expected to handle abrupt termination
+                // Note: We use TerminateProcess directly here as github_fast.exe is expected to handle
+                // abrupt termination gracefully. The tool should be designed to clean up partial downloads.
+                // A more sophisticated approach would be to send CTRL_BREAK_EVENT first, but since
+                // github_fast.exe is a specialized tool under our control, immediate termination is acceptable.
                 TerminateProcess(process.get(), 1);
                 return {};
             }
@@ -238,21 +272,24 @@ namespace AppInstaller::Utility
             }
 
             // Compute hash of downloaded file
-            std::ifstream inStream{ dest, std::ifstream::binary };
-            if (!inStream.is_open() || !inStream.good())
             {
-                AICLI_LOG(Core, Error, << "Failed to open downloaded file for hash computation: " << dest);
-                return {};
+                std::ifstream inStream{ dest, std::ifstream::binary };
+                if (!inStream.is_open() || !inStream.good())
+                {
+                    AICLI_LOG(Core, Error, << "Failed to open downloaded file for hash computation: " << dest);
+                    return {};
+                }
+
+                auto hashDetails = SHA256::ComputeHashDetails(inStream);
+                // Stream will be closed when it goes out of scope
+
+                DownloadResult result;
+                result.SizeInBytes = hashDetails.SizeInBytes;
+                result.Sha256Hash = hashDetails.Hash;
+                AICLI_LOG(Core, Info, << "Download completed via github_fast.exe. Hash: " << SHA256::ConvertToString(result.Sha256Hash));
+
+                return result;
             }
-
-            auto hashDetails = SHA256::ComputeHashDetails(inStream);
-
-            DownloadResult result;
-            result.SizeInBytes = hashDetails.SizeInBytes;
-            result.Sha256Hash = hashDetails.Hash;
-            AICLI_LOG(Core, Info, << "Download completed via github_fast.exe. Hash: " << SHA256::ConvertToString(result.Sha256Hash));
-
-            return result;
         }
     }
 
