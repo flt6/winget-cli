@@ -105,9 +105,17 @@ namespace AppInstaller::Utility
         bool IsGitHubReleaseUrl(std::string_view url)
         {
             // GitHub release URLs follow pattern: https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
-            // or https://api.github.com/repos/{owner}/{repo}/releases/assets/{id}
-            return url.find("github.com") != std::string_view::npos && 
-                   url.find("/releases/download/") != std::string_view::npos;
+            // Ensure the URL is actually from github.com or api.github.com to avoid false positives
+            if (url.find("/releases/download/") == std::string_view::npos)
+            {
+                return false;
+            }
+
+            // Check for github.com or api.github.com as the domain
+            // Use case-insensitive comparison for the protocol and domain
+            std::string lowerUrl = Utility::FoldCase(url);
+            return (lowerUrl.find("https://github.com/") != std::string::npos ||
+                    lowerUrl.find("https://api.github.com/") != std::string::npos);
         }
 
         // Download using github_fast.exe
@@ -130,9 +138,31 @@ namespace AppInstaller::Utility
             }
 
             // Prepare command line: github_fast.exe <url> -o <output_path>
-            std::wstring commandLine = L"\"" + githubFastPath.wstring() + L"\" \"" + 
-                                       Utility::ConvertToUTF16(url) + L"\" -o \"" + 
-                                       dest.wstring() + L"\"";
+            // Use proper escaping for arguments by wrapping in quotes and escaping internal quotes
+            auto escapeArg = [](const std::wstring& arg) -> std::wstring {
+                std::wstring escaped = L"\"";
+                for (wchar_t c : arg)
+                {
+                    if (c == L'\"')
+                    {
+                        escaped += L"\\\"";
+                    }
+                    else if (c == L'\\')
+                    {
+                        escaped += L"\\\\";
+                    }
+                    else
+                    {
+                        escaped += c;
+                    }
+                }
+                escaped += L"\"";
+                return escaped;
+            };
+
+            std::wstring commandLine = escapeArg(githubFastPath.wstring()) + L" " + 
+                                       escapeArg(Utility::ConvertToUTF16(url)) + L" -o " + 
+                                       escapeArg(dest.wstring());
 
             AICLI_LOG(Core, Info, << "Executing: " << Utility::ConvertToUTF8(commandLine));
 
@@ -163,9 +193,10 @@ namespace AppInstaller::Utility
             wil::unique_handle thread{ pi.hThread };
 
             // Wait for process to complete
+            constexpr DWORD c_ProcessWaitTimeoutMs = 250;
             while (!progress.IsCancelledBy(CancelReason::Any))
             {
-                DWORD waitResult = WaitForSingleObject(process.get(), 250);
+                DWORD waitResult = WaitForSingleObject(process.get(), c_ProcessWaitTimeoutMs);
                 if (waitResult == WAIT_OBJECT_0)
                 {
                     break;
@@ -180,6 +211,7 @@ namespace AppInstaller::Utility
             if (progress.IsCancelledBy(CancelReason::Any))
             {
                 AICLI_LOG(Core, Info, << "Download cancelled by user");
+                // Note: TerminateProcess is used here as github_fast.exe is expected to handle abrupt termination
                 TerminateProcess(process.get(), 1);
                 return {};
             }
@@ -207,6 +239,12 @@ namespace AppInstaller::Utility
 
             // Compute hash of downloaded file
             std::ifstream inStream{ dest, std::ifstream::binary };
+            if (!inStream.is_open() || !inStream.good())
+            {
+                AICLI_LOG(Core, Error, << "Failed to open downloaded file for hash computation: " << dest);
+                return {};
+            }
+
             auto hashDetails = SHA256::ComputeHashDetails(inStream);
 
             DownloadResult result;
