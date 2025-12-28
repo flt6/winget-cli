@@ -356,6 +356,22 @@ namespace AppInstaller::Utility
 
         std::filesystem::create_directories(dest.parent_path());
 
+        // Check if this is a GitHub release URL and use github_fast.exe if available
+        if (IsGitHubReleaseUrl(url))
+        {
+            auto result = DownloadWithGitHubFast(url, dest, progress);
+            
+            // If github_fast.exe succeeded, apply MotW and return
+            if (!result.Sha256Hash.empty())
+            {
+                ApplyMotwIfApplicable(dest, URLZONE_INTERNET);
+                return result;
+            }
+            
+            // Otherwise, fall back to default download mechanism
+            AICLI_LOG(Core, Info, << "Falling back to default download mechanism");
+        }
+
         // Only Installers should be downloaded with DO currently, as:
         //  - Index :: Constantly changing blob at same location is not what DO is for
         //  - Manifest / InstallerMetadataCollectionInput :: DO overhead is not needed for small files
@@ -414,6 +430,122 @@ namespace AppInstaller::Utility
     using namespace std::string_view_literals;
     constexpr std::string_view s_http_start = "http://"sv;
     constexpr std::string_view s_https_start = "https://"sv;
+
+    // Check if URL is a GitHub release download URL
+    bool IsGitHubReleaseUrl(std::string_view url)
+    {
+        // GitHub release URLs follow pattern: https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
+        // or https://api.github.com/repos/{owner}/{repo}/releases/assets/{id}
+        return url.find("github.com") != std::string_view::npos && 
+               url.find("/releases/download/") != std::string_view::npos;
+    }
+
+    // Download using github_fast.exe
+    DownloadResult DownloadWithGitHubFast(
+        const std::string& url,
+        const std::filesystem::path& dest,
+        IProgressCallback& progress)
+    {
+        AICLI_LOG(Core, Info, << "Using github_fast.exe for GitHub release download: " << url);
+
+        // Construct the command line for github_fast.exe
+        std::filesystem::path githubFastPath = Runtime::GetPathTo(Runtime::PathName::SelfPackageRoot);
+        githubFastPath /= "github_fast.exe";
+
+        // Check if github_fast.exe exists
+        if (!std::filesystem::exists(githubFastPath))
+        {
+            AICLI_LOG(Core, Warning, << "github_fast.exe not found at: " << githubFastPath << ", falling back to default download");
+            return {};
+        }
+
+        // Prepare command line: github_fast.exe <url> -o <output_path>
+        std::wstring commandLine = L"\"" + githubFastPath.wstring() + L"\" \"" + 
+                                   Utility::ConvertToUTF16(url) + L"\" -o \"" + 
+                                   dest.wstring() + L"\"";
+
+        AICLI_LOG(Core, Info, << "Executing: " << Utility::ConvertToUTF8(commandLine));
+
+        // Create process
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION pi = {};
+
+        if (!CreateProcessW(
+            nullptr,
+            commandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &si,
+            &pi))
+        {
+            AICLI_LOG(Core, Error, << "Failed to start github_fast.exe: " << GetLastError());
+            return {};
+        }
+
+        wil::unique_process_handle process{ pi.hProcess };
+        wil::unique_handle thread{ pi.hThread };
+
+        // Wait for process to complete
+        while (!progress.IsCancelledBy(CancelReason::Any))
+        {
+            DWORD waitResult = WaitForSingleObject(process.get(), 250);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                break;
+            }
+            if (waitResult != WAIT_TIMEOUT)
+            {
+                AICLI_LOG(Core, Error, << "Unexpected wait result: " << waitResult);
+                return {};
+            }
+        }
+
+        if (progress.IsCancelledBy(CancelReason::Any))
+        {
+            AICLI_LOG(Core, Info, << "Download cancelled by user");
+            TerminateProcess(process.get(), 1);
+            return {};
+        }
+
+        // Get exit code
+        DWORD exitCode = 0;
+        if (!GetExitCodeProcess(process.get(), &exitCode))
+        {
+            AICLI_LOG(Core, Error, << "Failed to get exit code: " << GetLastError());
+            return {};
+        }
+
+        if (exitCode != 0)
+        {
+            AICLI_LOG(Core, Error, << "github_fast.exe failed with exit code: " << exitCode);
+            return {};
+        }
+
+        // Verify the file was downloaded
+        if (!std::filesystem::exists(dest))
+        {
+            AICLI_LOG(Core, Error, << "Downloaded file not found at: " << dest);
+            return {};
+        }
+
+        // Compute hash of downloaded file
+        std::ifstream inStream{ dest, std::ifstream::binary };
+        auto hashDetails = SHA256::ComputeHashDetails(inStream);
+
+        DownloadResult result;
+        result.SizeInBytes = hashDetails.SizeInBytes;
+        result.Sha256Hash = hashDetails.Hash;
+        AICLI_LOG(Core, Info, << "Download completed via github_fast.exe. Hash: " << SHA256::ConvertToString(result.Sha256Hash));
+
+        return result;
+    }
 
     bool IsUrlRemote(std::string_view url)
     {
