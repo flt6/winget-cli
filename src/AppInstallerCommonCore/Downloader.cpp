@@ -100,6 +100,199 @@ namespace AppInstaller::Utility
             std::wstring retryAfter = GetHttpQueryString(urlFile, HTTP_QUERY_RETRY_AFTER);
             return retryAfter.empty() ? 0s : AppInstaller::Utility::GetRetryAfter(retryAfter);
         }
+
+        // Check if URL is a GitHub release download URL
+        bool IsGitHubReleaseUrl(std::string_view url)
+        {
+            // GitHub release URLs follow pattern: https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
+            // Ensure the URL is actually from github.com or api.github.com to avoid false positives
+            if (url.find("/releases/download/") == std::string_view::npos)
+            {
+                return false;
+            }
+
+            // Parse the URL to check the actual domain
+            // The URL should start with https://github.com/ or https://api.github.com/
+            if (!CaseInsensitiveStartsWith(url, "https://github.com/") &&
+                !CaseInsensitiveStartsWith(url, "https://api.github.com/"))
+            {
+                return false;
+            }
+
+            // Additional check: ensure the domain ends properly (followed by / or end of string)
+            // This prevents matching domains like github.com.malicious.org
+            size_t domainEndPos = url.find('/', 8); // Skip past "https://"
+            if (domainEndPos != std::string_view::npos)
+            {
+                std::string_view domain = url.substr(8, domainEndPos - 8);
+                return (CaseInsensitiveEquals(domain, "github.com") || 
+                        CaseInsensitiveEquals(domain, "api.github.com"));
+            }
+
+            return false;
+        }
+
+        // Download using github_fast.exe
+        DownloadResult DownloadWithGitHubFast(
+            const std::string& url,
+            const std::filesystem::path& dest,
+            IProgressCallback& progress)
+        {
+            AICLI_LOG(Core, Info, << "Using github_fast.exe for GitHub release download: " << url);
+
+            // Construct the command line for github_fast.exe
+            std::filesystem::path githubFastPath = Runtime::GetPathTo(Runtime::PathName::SelfPackageRoot);
+            githubFastPath /= "github_fast.exe";
+
+            // Check if github_fast.exe exists
+            if (!std::filesystem::exists(githubFastPath))
+            {
+                AICLI_LOG(Core, Warning, << "github_fast.exe not found at: " << githubFastPath << ", falling back to default download");
+                return {};
+            }
+
+            // Prepare command line: github_fast.exe <url> -o <output_path>
+            // Use proper Windows command line escaping according to MSDN rules:
+            // 1. Backslashes are interpreted literally unless they immediately precede a double quote
+            // 2. When backslashes precede a quote, each pair of backslashes represents one literal backslash
+            // 3. An odd number of backslashes followed by a quote means the quote is escaped
+            auto escapeArg = [](const std::wstring& arg) -> std::wstring {
+                std::wstring result = L"\"";
+                size_t backslashCount = 0;
+                
+                for (wchar_t c : arg)
+                {
+                    if (c == L'\\')
+                    {
+                        backslashCount++;
+                    }
+                    else if (c == L'\"')
+                    {
+                        // Escape the backslashes (double them) before the quote
+                        result.append(backslashCount * 2, L'\\');
+                        // Escape the quote itself
+                        result += L"\\\"";
+                        backslashCount = 0;
+                    }
+                    else
+                    {
+                        // Regular character - backslashes don't need escaping
+                        result.append(backslashCount, L'\\');
+                        result += c;
+                        backslashCount = 0;
+                    }
+                }
+                
+                // Escape trailing backslashes (they precede the closing quote)
+                result.append(backslashCount * 2, L'\\');
+                result += L"\"";
+                return result;
+            };
+
+            std::wstring commandLineStr = escapeArg(githubFastPath.wstring()) + L" " + 
+                                          escapeArg(Utility::ConvertToUTF16(url)) + L" -o " + 
+                                          escapeArg(dest.wstring());
+
+            AICLI_LOG(Core, Info, << "Executing: " << Utility::ConvertToUTF8(commandLineStr));
+
+            // Create process
+            STARTUPINFOW si = { sizeof(si) };
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+
+            PROCESS_INFORMATION pi = {};
+
+            // CreateProcessW may modify the command line buffer, so we need a mutable copy
+            std::vector<wchar_t> commandLine(commandLineStr.begin(), commandLineStr.end());
+            commandLine.push_back(L'\0');
+
+            if (!CreateProcessW(
+                nullptr,
+                commandLine.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si,
+                &pi))
+            {
+                AICLI_LOG(Core, Error, << "Failed to start github_fast.exe: " << GetLastError());
+                return {};
+            }
+
+            wil::unique_process_handle process{ pi.hProcess };
+            wil::unique_handle thread{ pi.hThread };
+
+            // Wait for process to complete
+            constexpr DWORD c_ProcessWaitTimeoutMs = 250;
+            while (!progress.IsCancelledBy(CancelReason::Any))
+            {
+                DWORD waitResult = WaitForSingleObject(process.get(), c_ProcessWaitTimeoutMs);
+                if (waitResult == WAIT_OBJECT_0)
+                {
+                    break;
+                }
+                if (waitResult != WAIT_TIMEOUT)
+                {
+                    AICLI_LOG(Core, Error, << "Unexpected wait result: " << waitResult);
+                    return {};
+                }
+            }
+
+            if (progress.IsCancelledBy(CancelReason::Any))
+            {
+                AICLI_LOG(Core, Info, << "Download cancelled by user");
+                // Note: We use TerminateProcess directly here as github_fast.exe is expected to handle
+                // abrupt termination gracefully. The tool should be designed to clean up partial downloads.
+                // A more sophisticated approach would be to send CTRL_BREAK_EVENT first, but since
+                // github_fast.exe is a specialized tool under our control, immediate termination is acceptable.
+                TerminateProcess(process.get(), 1);
+                return {};
+            }
+
+            // Get exit code
+            DWORD exitCode = 0;
+            if (!GetExitCodeProcess(process.get(), &exitCode))
+            {
+                AICLI_LOG(Core, Error, << "Failed to get exit code: " << GetLastError());
+                return {};
+            }
+
+            if (exitCode != 0)
+            {
+                AICLI_LOG(Core, Error, << "github_fast.exe failed with exit code: " << exitCode);
+                return {};
+            }
+
+            // Verify the file was downloaded
+            if (!std::filesystem::exists(dest))
+            {
+                AICLI_LOG(Core, Error, << "Downloaded file not found at: " << dest);
+                return {};
+            }
+
+            // Compute hash of downloaded file
+            {
+                std::ifstream inStream{ dest, std::ifstream::binary };
+                if (!inStream.is_open() || !inStream.good())
+                {
+                    AICLI_LOG(Core, Error, << "Failed to open downloaded file for hash computation: " << dest);
+                    return {};
+                }
+
+                auto hashDetails = SHA256::ComputeHashDetails(inStream);
+                // Stream will be closed when it goes out of scope
+
+                DownloadResult result;
+                result.SizeInBytes = hashDetails.SizeInBytes;
+                result.Sha256Hash = hashDetails.Hash;
+                AICLI_LOG(Core, Info, << "Download completed via github_fast.exe. Hash: " << SHA256::ConvertToString(result.Sha256Hash));
+
+                return result;
+            }
+        }
     }
 
 #ifndef AICLI_DISABLE_TEST_HOOKS
@@ -355,6 +548,22 @@ namespace AppInstaller::Utility
         AICLI_LOG(Core, Info, << "Downloading to path: " << dest);
 
         std::filesystem::create_directories(dest.parent_path());
+
+        // Check if this is a GitHub release URL and use github_fast.exe if available
+        if (IsGitHubReleaseUrl(url))
+        {
+            auto result = DownloadWithGitHubFast(url, dest, progress);
+            
+            // If github_fast.exe succeeded, apply MotW and return
+            if (!result.Sha256Hash.empty())
+            {
+                ApplyMotwIfApplicable(dest, URLZONE_INTERNET);
+                return result;
+            }
+            
+            // Otherwise, fall back to default download mechanism
+            AICLI_LOG(Core, Info, << "Falling back to default download mechanism");
+        }
 
         // Only Installers should be downloaded with DO currently, as:
         //  - Index :: Constantly changing blob at same location is not what DO is for
