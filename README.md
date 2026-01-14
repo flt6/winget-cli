@@ -1,3 +1,5 @@
+**This is a patch of Winget. Use [github_fast](https://github.com/flt6/tools/blob/master/github_down/gen_win.cpp) (Description in https://www.52pojie.cn/thread-2081420-1-1.html) to enhance download speed of Github Release download.**
+
 # ![WinGet Icon](.github/images/WindowsPackageManager_Assets/ICO/PNG/_40.png) Windows Package Manager
 
 ## WinGet Client
@@ -120,4 +122,5 @@ In short, to opt out, do one of the following:
 **Windows 10**: Go to `Start`, then select `Settings` > `Privacy` > `Diagnostics & feedback`, and select `Required diagnostic data`.
 
 See the [privacy statement](PRIVACY.md) for more details.
+
 
